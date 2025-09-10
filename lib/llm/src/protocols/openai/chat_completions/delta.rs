@@ -1,400 +1,291 @@
-// SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+#  SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#  SPDX-License-Identifier: Apache-2.0
 
-use super::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse};
-use crate::{
-    local_model::runtime_config::ModelRuntimeConfig,
-    protocols::common::{self},
-    types::TokenIdType,
-};
-use dynamo_parsers::{ParserResult, ReasoningParser, ReasoningParserType, ReasoningParserWrapper};
+# Usage: `python -m dynamo.frontend [args]`
+#
+# Start a frontend node. This runs:
+# - OpenAI HTTP server.
+# - Auto-discovery: Watches etcd for engine/worker registration (via `register_llm`).
+# - Pre-processor: Prompt templating and tokenization.
+# - Router, defaulting to round-robin (TODO: Add flags to enable KV routing).
+#
+# Pass `--interactive` or `-i` for text chat instead of HTTP server.
+#
+# For static mode (no etcd auto-discovery):
+# - python -m dynamo.frontend --model-name Qwen3-0.6B-Q8_0.gguf --model-path ~/llms/Qwen3-0.6B --static-endpoint dynamo.backend.generate
+# Worker example:
+# - cd lib/bindings/python/examples/hello_world
+# - python server_sglang_static.py
+#
+# For TLS:
+# - python -m dynamo.frontend --http-port 8443 --tls-cert-path cert.pem --tls-key-path key.pem
+#
 
-/// Provides a method for generating a [`DeltaGenerator`] from a chat completion request.
-impl NvCreateChatCompletionRequest {
-    /// Creates a [`DeltaGenerator`] instance based on the chat completion request.
-    ///
-    /// # Arguments
-    /// * `request_id` - The request ID to use for the chat completion response ID.
-    ///
-    /// # Returns
-    /// * [`DeltaGenerator`] configured with model name and response options.
-    pub fn response_generator(&self, request_id: String) -> DeltaGenerator {
-        let options = DeltaGeneratorOptions {
-            enable_usage: true,
-            enable_logprobs: self.inner.logprobs.unwrap_or(false)
-                || self.inner.top_logprobs.unwrap_or(0) > 0,
-            runtime_config: ModelRuntimeConfig::default(),
-        };
+import argparse
+import asyncio
+import logging
+import os
+import pathlib
+import re
 
-        DeltaGenerator::new(self.inner.model.clone(), options, request_id)
-    }
-}
+import uvloop
 
-/// Configuration options for the [`DeltaGenerator`], controlling response behavior.
-#[derive(Debug, Clone, Default)]
-pub struct DeltaGeneratorOptions {
-    /// Determines whether token usage statistics should be included in the response.
-    pub enable_usage: bool,
-    /// Determines whether log probabilities should be included in the response.
-    pub enable_logprobs: bool,
+from dynamo.llm import (
+    EngineType,
+    EntrypointArgs,
+    KvRouterConfig,
+    RouterConfig,
+    RouterMode,
+    make_engine,
+    run_input,
+)
+from dynamo.runtime import DistributedRuntime
 
-    pub runtime_config: ModelRuntimeConfig,
-}
+from . import __version__
 
-/// Generates incremental chat completion responses in a streaming fashion.
-#[derive(Debug)]
-pub struct DeltaGenerator {
-    /// Unique identifier for the chat completion session.
-    id: String,
-    /// Object type, representing a streamed chat completion response.
-    object: String,
-    /// Timestamp (Unix epoch) when the response was created.
-    created: u32,
-    model: String,
-    /// Optional system fingerprint for version tracking.
-    system_fingerprint: Option<String>,
-    /// Optional service tier information for the response.
-    service_tier: Option<dynamo_async_openai::types::ServiceTierResponse>,
-    /// Tracks token usage for the completion request.
-    usage: dynamo_async_openai::types::CompletionUsage,
-    /// Tracks reasoning tokens separately for observability
-    reasoning_token_count: u32,
-    /// Counter tracking the number of messages issued.
-    msg_counter: u64,
-    /// Configuration options for response generation.
-    options: DeltaGeneratorOptions,
+DYNAMO_NAMESPACE_ENV_VAR = "DYN_NAMESPACE"
 
-    /// Reasoning Parser object
-    /// This is used to parse reasoning content in the response.
-    reasoning_parser: ReasoningParserWrapper,
-}
+logger = logging.getLogger(__name__)
 
-impl DeltaGenerator {
-    /// Creates a new [`DeltaGenerator`] instance with the specified model and options.
-    ///
-    /// # Arguments
-    /// * `model` - The model name used for response generation.
-    /// * `options` - Configuration options for enabling usage and log probabilities.
-    /// * `request_id` - The request ID to use for the chat completion response.
-    ///
-    /// # Returns
-    /// * A new instance of [`DeltaGenerator`].
-    pub fn new(model: String, options: DeltaGeneratorOptions, request_id: String) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
 
-        // SAFETY: Casting from `u64` to `u32` could lead to precision loss after `u32::MAX`,
-        // but this will not be an issue until 2106.
-        let now: u32 = now.try_into().expect("timestamp exceeds u32::MAX");
+def validate_static_endpoint(value):
+    """Validate that static-endpoint is three words separated by dots."""
+    if not re.match(
+        r"^[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*$",
+        value,
+    ):
+        raise argparse.ArgumentTypeError(
+            f"static-endpoint must be three words separated by dots, got: {value}"
+        )
+    return value
 
-        let usage = dynamo_async_openai::types::CompletionUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-        };
 
-        // Reasoning parser type
-        // This is hardcoded for now, but can be made configurable later.
-        // TODO: Make parser type configurable once front-end integration is determined
-        // Change to GptOss to test GptOSS parser
-        // Reasoning parser wrapper
-        let reasoning_parser = ReasoningParserType::get_reasoning_parser_from_name(
-            options
-                .runtime_config
-                .reasoning_parser
-                .as_deref()
-                .unwrap_or("basic"),
-        );
+def validate_model_name(value):
+    """Validate that model-name is a non-empty string."""
+    if not value or not isinstance(value, str) or len(value.strip()) == 0:
+        raise argparse.ArgumentTypeError(
+            f"model-name must be a non-empty string, got: {value}"
+        )
+    return value.strip()
 
-        let chatcmpl_id = format!("chatcmpl-{request_id}");
 
-        Self {
-            id: chatcmpl_id,
-            object: "chat.completion.chunk".to_string(),
-            created: now,
-            model,
-            system_fingerprint: None,
-            service_tier: None,
-            usage,
-            reasoning_token_count: 0,
-            msg_counter: 0,
-            options,
-            reasoning_parser,
-        }
-    }
+def validate_model_path(value):
+    """Validate that model-path is a valid directory on disk."""
+    if not os.path.isdir(value):
+        raise argparse.ArgumentTypeError(
+            f"model-path must be a valid directory on disk, got: {value}"
+        )
+    return value
 
-    /// Updates the prompt token usage count.
-    ///
-    /// # Arguments
-    /// * `isl` - The number of prompt tokens used.
-    pub fn update_isl(&mut self, isl: u32) {
-        self.usage.prompt_tokens = isl;
-    }
 
-    /// Updates the reasoning token count based on the reasoning text and available token IDs.
-    ///
-    /// # Arguments
-    /// * `reasoning_text` - The reasoning text to count tokens for.
-    /// * `total_text` - The total text (reasoning + normal) from the delta.
-    /// * `token_ids` - The token IDs for the total text.
-    fn update_reasoning_tokens(&mut self, reasoning_text: &str, total_text: &str, token_ids: &[u32]) {
-        if !reasoning_text.is_empty() && !total_text.is_empty() {
-            // Estimate reasoning tokens based on the proportion of reasoning text to total text
-            // This is more accurate than word counting alone
-            let reasoning_chars = reasoning_text.chars().count() as f32;
-            let total_chars = total_text.chars().count() as f32;
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Dynamo Frontend: HTTP+Pre-processor+Router",
+        formatter_class=argparse.RawTextHelpFormatter,  # To preserve multi-line help formatting
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"Dynamo Frontend {__version__}"
+    )
+    parser.add_argument(
+        "-i", "--interactive", action="store_true", help="Interactive text chat"
+    )
+    parser.add_argument(
+        "--kv-cache-block-size", type=int, help="KV cache block size (u32)."
+    )
+    parser.add_argument(
+        "--http-host",
+        type=str,
+        default=os.environ.get("DYN_HTTP_HOST", "0.0.0.0"),
+        help="HTTP host for the engine (str). Can be set via DYN_HTTP_HOST env var.",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=int(os.environ.get("DYN_HTTP_PORT", "8000")),
+        help="HTTP port for the engine (u16). Can be set via DYN_HTTP_PORT env var.",
+    )
+    parser.add_argument(
+        "--tls-cert-path",
+        type=pathlib.Path,
+        default=None,
+        help="TLS certificate path, PEM format.",
+    )
+    parser.add_argument(
+        "--tls-key-path",
+        type=pathlib.Path,
+        default=None,
+        help="TLS certificate key path, PEM format.",
+    )
+    parser.add_argument(
+        "--router-mode",
+        type=str,
+        choices=["round-robin", "random", "kv"],
+        default=os.environ.get("DYN_ROUTER_MODE", "round-robin"),
+        help="How to route the request. Can be set via DYN_ROUTER_MODE env var.",
+    )
+    parser.add_argument(
+        "--kv-overlap-score-weight",
+        type=float,
+        default=1.0,
+        help="KV Router: Weight for overlap score in worker selection. Higher values prioritize KV cache reuse.",
+    )
+    parser.add_argument(
+        "--router-temperature",
+        type=float,
+        default=0.0,
+        help="KV Router: Temperature for worker sampling via softmax. Higher values promote more randomness, and 0 fallbacks to deterministic.",
+    )
+    parser.add_argument(
+        "--no-kv-events",
+        action="store_false",
+        dest="use_kv_events",
+        default=True,
+        help="KV Router: Disable KV events. When set, uses ApproxKvRouter for predicting block creation/deletion based only on incoming requests at a timer. By default, KV events are enabled.",
+    )
+    parser.add_argument(
+        "--namespace",
+        type=str,
+        default=os.environ.get(DYNAMO_NAMESPACE_ENV_VAR),
+        help="Dynamo namespace for model discovery scoping. If specified, models will only be discovered from this namespace. If not specified, discovers models from all namespaces (global discovery).",
+    )
+    parser.add_argument(
+        "--router-replica-sync",
+        action="store_true",
+        default=False,
+        help="KV Router: Enable replica synchronization across multiple router instances. When true, routers will publish and subscribe to events to maintain consistent state.",
+    )
+    parser.add_argument(
+        "--router-snapshot-threshold",
+        type=int,
+        default=10000,
+        help="KV Router: Number of messages in stream before triggering a snapshot. Defaults to 10000.",
+    )
+    parser.add_argument(
+        "--router-reset-states",
+        action="store_true",
+        dest="router_reset_states",
+        default=False,
+        help="KV Router: Reset router state on startup, purging stream and object store. By default, states are persisted. WARNING: This can affect existing router replicas.",
+    )
+    parser.add_argument(
+        "--busy-threshold",
+        type=float,
+        default=None,
+        help="Threshold (0.0-1.0) for determining when a worker is considered busy based on KV cache usage. If not set, busy detection is disabled.",
+    )
+    parser.add_argument(
+        "--static-endpoint",
+        type=validate_static_endpoint,
+        help="Static endpoint in format: word.word.word (e.g., dynamo.backend.generate)",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=validate_model_name,
+        help="Model name as a string (e.g., 'Llama-3.2-1B-Instruct')",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=validate_model_path,
+        help="Path to model directory on disk (e.g., /tmp/model_cache/lama3.2_1B/)",
+    )
+    parser.add_argument(
+        "--metrics-prefix",
+        type=str,
+        default=None,
+        help="Prefix for Dynamo frontend metrics. If unset, uses DYN_METRICS_PREFIX env var or 'dynamo_frontend'.",
+    )
+    parser.add_argument(
+        "--kserve-grpc-server",
+        action="store_true",
+        default=False,
+        help="Start KServe gRPC server.",
+    )
 
-            if total_chars > 0.0 {
-                let reasoning_proportion = reasoning_chars / total_chars;
-                let estimated_reasoning_tokens = (token_ids.len() as f32 * reasoning_proportion).ceil() as u32;
-                self.reasoning_token_count += estimated_reasoning_tokens;
-            }
-        }
-    }
+    flags = parser.parse_args()
 
-    pub fn create_logprobs(
-        &self,
-        tokens: Vec<common::llm_backend::TokenType>,
-        token_ids: &[TokenIdType],
-        logprobs: Option<common::llm_backend::LogProbs>,
-        top_logprobs: Option<common::llm_backend::TopLogprobs>,
-    ) -> Option<dynamo_async_openai::types::ChatChoiceLogprobs> {
-        if !self.options.enable_logprobs || logprobs.is_none() {
-            return None;
-        }
+    if flags.static_endpoint and (not flags.model_name or not flags.model_path):
+        parser.error("--static-endpoint requires both --model-name and --model-path")
+    if bool(flags.tls_cert_path) ^ bool(flags.tls_key_path):  # ^ is XOR
+        parser.error("--tls-cert-path and --tls-key-path must be provided together")
 
-        let toks = tokens
-            .into_iter()
-            .zip(token_ids)
-            .map(|(token, token_id)| (token.unwrap_or_default(), *token_id))
-            .collect::<Vec<(String, TokenIdType)>>();
-        let tok_lps = toks
-            .iter()
-            .zip(logprobs.unwrap())
-            .map(|(_, lp)| lp as f32)
-            .collect::<Vec<f32>>();
+    return flags
 
-        let content = top_logprobs.map(|top_logprobs| {
-            toks.iter()
-                .zip(tok_lps)
-                .zip(top_logprobs)
-                .map(|(((t, tid), lp), top_lps)| {
-                    let mut found_selected_token = false;
-                    let mut converted_top_lps = top_lps
-                        .iter()
-                        .map(|top_lp| {
-                            let top_t = top_lp.token.clone().unwrap_or_default();
-                            let top_tid = top_lp.token_id;
-                            found_selected_token = found_selected_token || top_tid == *tid;
-                            dynamo_async_openai::types::TopLogprobs {
-                                token: top_t,
-                                logprob: top_lp.logprob as f32,
-                                bytes: None,
-                            }
-                        })
-                        .collect::<Vec<dynamo_async_openai::types::TopLogprobs>>();
-                    if !found_selected_token {
-                        // If the selected token is not in the top logprobs, add it
-                        converted_top_lps.push(dynamo_async_openai::types::TopLogprobs {
-                            token: t.clone(),
-                            logprob: lp,
-                            bytes: None,
-                        });
-                    }
-                    dynamo_async_openai::types::ChatCompletionTokenLogprob {
-                        token: t.clone(),
-                        logprob: lp,
-                        bytes: None,
-                        top_logprobs: converted_top_lps,
-                    }
-                })
-                .collect()
-        });
 
-        Some(dynamo_async_openai::types::ChatChoiceLogprobs {
-            content,
-            refusal: None,
-        })
-    }
+async def async_main():
+    flags = parse_args()
+    is_static = bool(flags.static_endpoint)  # true if the string has a value
 
-    fn create_reasoning_content(
-        &mut self,
-        text: &Option<String>,
-        token_ids: &[u32],
-    ) -> Option<ParserResult> {
-        let text_ref = text.as_deref().unwrap_or("");
-        if text_ref.is_empty() && token_ids.is_empty() {
-            return None;
-        }
-        let parser_result = self
-            .reasoning_parser
-            .parse_reasoning_streaming_incremental(text_ref, token_ids);
+    # Configure Dynamo frontend HTTP service metrics prefix
+    if flags.metrics_prefix is not None:
+        prefix = flags.metrics_prefix.strip()
+        if prefix:
+            os.environ["DYN_METRICS_PREFIX"] = flags.metrics_prefix
 
-        Some(parser_result)
-    }
+    runtime = DistributedRuntime(asyncio.get_running_loop(), is_static)
 
-    /// Creates a choice within a chat completion response.
-    ///
-    /// # Arguments
-    /// * `index` - The index of the choice in the completion response.
-    /// * `text` - The text content for the response.
-    /// * `finish_reason` - The reason why the response finished (e.g., stop, length, etc.).
-    /// * `logprobs` - Optional log probabilities of the generated tokens.
-    ///
-    /// # Returns
-    /// * An [`dynamo_async_openai::types::CreateChatCompletionStreamResponse`] instance representing the choice.
-    #[allow(deprecated)]
-    pub fn create_choice(
-        &mut self,
-        index: u32,
-        text: Option<String>,
-        reasoning_content: Option<String>,
-        finish_reason: Option<dynamo_async_openai::types::FinishReason>,
-        logprobs: Option<dynamo_async_openai::types::ChatChoiceLogprobs>,
-    ) -> NvCreateChatCompletionStreamResponse {
-        let delta = dynamo_async_openai::types::ChatCompletionStreamResponseDelta {
-            content: text,
-            function_call: None,
-            tool_calls: None,
-            role: if self.msg_counter == 0 {
-                Some(dynamo_async_openai::types::Role::Assistant)
-            } else {
-                None
-            },
-            refusal: None,
-            reasoning_content,
-        };
+    if flags.router_mode == "kv":
+        router_mode = RouterMode.KV
+        kv_router_config = KvRouterConfig(
+            overlap_score_weight=flags.kv_overlap_score_weight,
+            router_temperature=flags.router_temperature,
+            use_kv_events=flags.use_kv_events,
+            router_replica_sync=flags.router_replica_sync,
+            router_snapshot_threshold=flags.router_snapshot_threshold,
+            router_reset_states=flags.router_reset_states,
+        )
+    elif flags.router_mode == "random":
+        router_mode = RouterMode.Random
+        kv_router_config = None
+    else:
+        router_mode = RouterMode.RoundRobin
+        kv_router_config = None
 
-        let choice = dynamo_async_openai::types::ChatChoiceStream {
-            index,
-            delta,
-            finish_reason,
-            logprobs,
-        };
-
-        let choices = vec![choice];
-
-        let mut usage = self.usage.clone();
-        if self.options.enable_usage {
-            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-
-            // Update completion_tokens_details with reasoning tokens if we have any
-            if self.reasoning_token_count > 0 {
-                // Preserve existing completion_tokens_details if they exist, or create new ones
-                let mut details = usage.completion_tokens_details.unwrap_or_default();
-                details.reasoning_tokens = Some(self.reasoning_token_count);
-                usage.completion_tokens_details = Some(details);
-            }
-        }
-
-        dynamo_async_openai::types::CreateChatCompletionStreamResponse {
-            id: self.id.clone(),
-            object: self.object.clone(),
-            created: self.created,
-            model: self.model.clone(),
-            system_fingerprint: self.system_fingerprint.clone(),
-            choices,
-            usage: if self.options.enable_usage {
-                Some(usage)
-            } else {
-                None
-            },
-            service_tier: self.service_tier.clone(),
-        }
-    }
-}
-
-/// Implements the [`crate::protocols::openai::DeltaGeneratorExt`] trait for [`DeltaGenerator`], allowing
-/// it to transform backend responses into OpenAI-style streaming responses.
-impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamResponse>
-    for DeltaGenerator
-{
-    /// Converts a backend response into a structured OpenAI-style streaming response.
-    ///
-    /// # Arguments
-    /// * `delta` - The backend response containing generated text and metadata.
-    ///
-    /// # Returns
-    /// * `Ok(NvCreateChatCompletionStreamResponse)` if conversion succeeds.
-    /// * `Err(anyhow::Error)` if an error occurs.
-    fn choice_from_postprocessor(
-        &mut self,
-        delta: crate::protocols::common::llm_backend::BackendOutput,
-    ) -> anyhow::Result<NvCreateChatCompletionStreamResponse> {
-        // Aggregate token usage if enabled.
-        if self.options.enable_usage {
-            // SAFETY: Casting from `usize` to `u32` could lead to precision loss after `u32::MAX`,
-            // but this will not be an issue until context lengths exceed 4_294_967_295.
-            let token_length: u32 = delta
-                .token_ids
-                .len()
-                .try_into()
-                .expect("token_ids length exceeds u32::MAX");
-
-            self.usage.completion_tokens += token_length;
-        }
-
-        let logprobs = self.create_logprobs(
-            delta.tokens,
-            &delta.token_ids,
-            delta.log_probs,
-            delta.top_logprobs,
-        );
-
-        // Map backend finish reasons to OpenAI's finish reasons.
-        let finish_reason = match delta.finish_reason {
-            Some(common::FinishReason::EoS) => Some(dynamo_async_openai::types::FinishReason::Stop),
-            Some(common::FinishReason::Stop) => {
-                Some(dynamo_async_openai::types::FinishReason::Stop)
-            }
-            Some(common::FinishReason::Length) => {
-                Some(dynamo_async_openai::types::FinishReason::Length)
-            }
-            Some(common::FinishReason::Cancelled) => {
-                Some(dynamo_async_openai::types::FinishReason::Stop)
-            }
-            Some(common::FinishReason::ContentFilter) => {
-                Some(dynamo_async_openai::types::FinishReason::ContentFilter)
-            }
-            Some(common::FinishReason::Error(err_msg)) => {
-                return Err(anyhow::anyhow!(err_msg));
-            }
-            None => None,
-        };
-
-        let reasoning_parser_result = self
-            .create_reasoning_content(&delta.text, &delta.token_ids)
-            .unwrap_or_default();
-
-        let (normal_text, reasoning_content) = (
-            reasoning_parser_result.get_some_normal_text(),
-            reasoning_parser_result.get_some_reasoning(),
-        );
-
-        // Update reasoning token count if we have reasoning content
-        if let Some(ref reasoning_text) = reasoning_content {
-            let total_text = delta.text.as_deref().unwrap_or("");
-            self.update_reasoning_tokens(reasoning_text, total_text, &delta.token_ids);
-        }
-
-        // Create the streaming response.
-        let index = 0;
-        let stream_response = self.create_choice(
-            index,
-            normal_text,
-            reasoning_content,
-            finish_reason,
-            logprobs,
-        );
-
-        Ok(stream_response)
+    kwargs = {
+        "http_host": flags.http_host,
+        "http_port": flags.http_port,
+        "kv_cache_block_size": flags.kv_cache_block_size,
+        "router_config": RouterConfig(
+            router_mode, kv_router_config, flags.busy_threshold
+        ),
     }
 
-    fn get_isl(&self) -> Option<u32> {
-        Some(self.usage.prompt_tokens)
-    }
-}
+    if flags.static_endpoint:
+        kwargs["endpoint_id"] = flags.static_endpoint
+
+    if flags.model_name:
+        kwargs["model_name"] = flags.model_name
+    if flags.model_path:
+        kwargs["model_path"] = flags.model_path
+    if flags.tls_cert_path:
+        kwargs["tls_cert_path"] = flags.tls_cert_path
+    if flags.tls_key_path:
+        kwargs["tls_key_path"] = flags.tls_key_path
+    if flags.namespace:
+        kwargs["namespace"] = flags.namespace
+
+    if is_static:
+        # out=dyn://<static_endpoint>
+        engine_type = EngineType.Static
+    else:
+        # out=auto, most common
+        engine_type = EngineType.Dynamic
+    e = EntrypointArgs(engine_type, **kwargs)
+    engine = await make_engine(runtime, e)
+
+    try:
+        if flags.interactive:
+            await run_input(runtime, "text", engine)
+        elif flags.kserve_grpc_server:
+            await run_input(runtime, "grpc", engine)
+        else:
+            await run_input(runtime, "http", engine)
+    except asyncio.exceptions.CancelledError:
+        pass
+
+
+def main():
+    uvloop.run(async_main())
+
+
+if __name__ == "__main__":
+    main()
