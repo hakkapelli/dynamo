@@ -130,11 +130,16 @@ pub async fn prepare_engine(
                     .namespace(&endpoint_id.namespace)?
                     .component("backend")
                     .unwrap_or_else(|_| {
-                        tracing::warn!("Backend component not found, using discovered component as fallback");
+                        tracing::warn!(
+                            "Backend component not found, using discovered component as fallback"
+                        );
                         component.clone()
                     });
 
-                let backend_client = backend_component.endpoint(&endpoint_id.name).client().await?;
+                let backend_client = backend_component
+                    .endpoint(&endpoint_id.name)
+                    .client()
+                    .await?;
 
                 tracing::info!(
                     "HTTP frontend KV routing: Using backend endpoint for request routing"

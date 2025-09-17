@@ -271,30 +271,32 @@ impl KvScheduler {
                 // 2. Decode workers handle full request lifecycle (prefill + decode)
                 // 3. Prevents decode requests from being sent to prefill-only workers
                 // 4. Enables optimal resource utilization in disaggregated architectures
-                let filtered_workers: HashMap<i64, Option<ModelRuntimeConfig>> =
-                    if request.request_id.starts_with("prefill_") {
-                        // PREFILL REQUEST ROUTING: Filter to prefill-capable workers
-                        // Only workers registered with component="prefill" can handle remote prefill requests
-                        all_workers
-                            .iter()
-                            .filter(|(worker_id, (_config, component))| {
-                                let is_prefill = component == "prefill";
-                                if is_prefill {
-                                    tracing::trace!(
-                                        "Including prefill worker {} in selection",
-                                        worker_id
-                                    );
-                                }
-                                is_prefill
-                            })
-                            .map(|(worker_id, (config, _component))| (*worker_id, config.clone()))
-                            .collect()
-                    } else {
-                        // DECODE REQUEST ROUTING: Filter to full-service decode-capable workers
-                        // Treat any component that is NOT explicitly "prefill" as decode-capable.
-                        // This preserves strict separation for prefill-only workers while
-                        // allowing unified components (e.g., "backend", "mocker") to serve decode.
-                        all_workers
+                let filtered_workers: HashMap<i64, Option<ModelRuntimeConfig>> = if request
+                    .request_id
+                    .starts_with("prefill_")
+                {
+                    // PREFILL REQUEST ROUTING: Filter to prefill-capable workers
+                    // Only workers registered with component="prefill" can handle remote prefill requests
+                    all_workers
+                        .iter()
+                        .filter(|(worker_id, (_config, component))| {
+                            let is_prefill = component == "prefill";
+                            if is_prefill {
+                                tracing::trace!(
+                                    "Including prefill worker {} in selection",
+                                    worker_id
+                                );
+                            }
+                            is_prefill
+                        })
+                        .map(|(worker_id, (config, _component))| (*worker_id, config.clone()))
+                        .collect()
+                } else {
+                    // DECODE REQUEST ROUTING: Filter to full-service decode-capable workers
+                    // Treat any component that is NOT explicitly "prefill" as decode-capable.
+                    // This preserves strict separation for prefill-only workers while
+                    // allowing unified components (e.g., "backend", "mocker") to serve decode.
+                    all_workers
                             .iter()
                             .filter(|(worker_id, (_config, component))| {
                                 let is_decode_capable = component != "prefill";
@@ -309,7 +311,7 @@ impl KvScheduler {
                             })
                             .map(|(worker_id, (config, _component))| (*worker_id, config.clone()))
                             .collect()
-                    };
+                };
 
                 // Log the filtering results for debugging
                 tracing::debug!(
