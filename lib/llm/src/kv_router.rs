@@ -607,7 +607,7 @@ impl KvRouter {
     /// * `Err(KvRouterError)` - If no prefill workers available or selection fails
     ///
     /// # Example Usage
-    /// ```rust
+    /// ```ignore
     /// // In decode worker handler, when remote prefill is needed:
     /// if disagg_router.prefill_remote(prefill_length, prefix_hit_length) {
     ///     let prefill_worker_id = kv_router.select_prefill_worker(

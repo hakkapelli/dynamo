@@ -290,19 +290,22 @@ impl KvScheduler {
                             .map(|(worker_id, (config, _component))| (*worker_id, config.clone()))
                             .collect()
                     } else {
-                        // DECODE REQUEST ROUTING: Filter to full-service decode workers
-                        // Only workers registered with component="backend" can handle full decode requests
+                        // DECODE REQUEST ROUTING: Filter to full-service decode-capable workers
+                        // Treat any component that is NOT explicitly "prefill" as decode-capable.
+                        // This preserves strict separation for prefill-only workers while
+                        // allowing unified components (e.g., "backend", "mocker") to serve decode.
                         all_workers
                             .iter()
                             .filter(|(worker_id, (_config, component))| {
-                                let is_decode = component == "backend";
-                                if is_decode {
+                                let is_decode_capable = component != "prefill";
+                                if is_decode_capable {
                                     tracing::trace!(
-                                        "Including decode worker {} in selection",
-                                        worker_id
+                                        "Including decode-capable worker {} (component: {}) in selection",
+                                        worker_id,
+                                        component
                                     );
                                 }
-                                is_decode
+                                is_decode_capable
                             })
                             .map(|(worker_id, (config, _component))| (*worker_id, config.clone()))
                             .collect()
