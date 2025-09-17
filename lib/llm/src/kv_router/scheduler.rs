@@ -12,6 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 
+// Type alias to reduce complexity of the workers configuration map
+type WorkerConfigMap = Arc<RwLock<HashMap<i64, (Option<ModelRuntimeConfig>, String)>>>;
+
 use super::KV_HIT_RATE_SUBJECT;
 use super::KvRouterConfig;
 use super::RouterConfigOverride;
@@ -116,7 +119,7 @@ impl KvScheduler {
         // 2. Apply different cost functions based on worker specialization
         // 3. Support disaggregated serving architectures with dedicated worker roles
         // 4. Maintain backward compatibility with unified worker deployments
-        let workers_with_configs: Arc<RwLock<HashMap<i64, (Option<ModelRuntimeConfig>, String)>>> = {
+        let workers_with_configs: WorkerConfigMap = {
             let mut initial_map = HashMap::new();
             for instance in &instances {
                 let worker_id = instance.instance_id;
