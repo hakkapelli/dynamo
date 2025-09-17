@@ -640,7 +640,7 @@ impl KvRouter {
             context_id,
             overlap_amount,
             tokens.len().div_ceil(self.block_size as usize),
-            if tokens.len() > 0 {
+            if !tokens.is_empty() {
                 (overlap_amount as f64 * self.block_size as f64 / tokens.len() as f64 * 100.0)
                     as u32
             } else {
@@ -744,7 +744,7 @@ impl KvRouter {
                                         // 3. Apply scheduler with prefill-specific cost function and filtering
                                         // 4. Return optimal worker ID based on cache overlap and load balancing
                                         match KvRouter::select_prefill_worker_core(
-                                            &*indexer,
+                                            &indexer,
                                             &scheduler,
                                             block_size,
                                             &format!("prefill_nats_{}", request_id),
