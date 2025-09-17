@@ -14,8 +14,8 @@ use llm_rs::kv_router::protocols::ForwardPassMetrics as RsForwardPassMetrics;
 use llm_rs::kv_router::protocols::KvStats as RsKvStats;
 use llm_rs::kv_router::protocols::SpecDecodeStats as RsSpecDecodeStats;
 use llm_rs::kv_router::protocols::WorkerStats as RsWorkerStats;
-use rs::traits::events::EventSubscriber;
 use rs::traits::events::EventPublisher;
+use rs::traits::events::EventSubscriber;
 use tracing;
 
 use llm_rs::kv_router::protocols::*;
@@ -1119,6 +1119,7 @@ impl KvPushRouter {
     ///     )
     ///     await send_to_prefill_worker(prefill_worker_id, request)
     /// ```
+    #[pyo3(signature = (context_id, token_ids, router_config_override=None))]
     fn select_prefill_worker<'p>(
         &self,
         py: Python<'p>,
@@ -1130,12 +1131,12 @@ impl KvPushRouter {
 
         // Convert Python router config override to Rust type if provided
         let config_override = if let Some(override_obj) = router_config_override {
-            Some(
-                depythonize(&override_obj.bind(py))
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Failed to parse router_config_override: {}", e)
-                    ))?
-            )
+            Some(depythonize(override_obj.bind(py)).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Failed to parse router_config_override: {}",
+                    e
+                ))
+            })?)
         } else {
             None
         };
@@ -1291,26 +1292,37 @@ impl FrontendRouterClient {
                 .map_err(to_pyerr)?;
             tracing::debug!("Successfully published prefill selection request");
 
-            // Wait for the router's selection decision (no timeout for consistency)
-            let response_msg = response_sub.next().await;
             // Wait for the router's selection decision with a timeout to avoid hangs
-            let response_msg = match tokio::time::timeout(std::time::Duration::from_millis(750), response_sub.next()).await {
+            // Wait for the router's selection decision with a timeout to avoid hangs
+            let response_msg = match tokio::time::timeout(
+                std::time::Duration::from_millis(750),
+                response_sub.next(),
+            )
+            .await
+            {
                 Ok(m) => m,
-                Err(_) => return Err(to_pyerr(anyhow::anyhow!("Router prefill selection timed out"))),
+                Err(_) => {
+                    return Err(to_pyerr(anyhow::anyhow!(
+                        "Router prefill selection timed out"
+                    )))
+                }
             };
 
             if let Some(msg) = response_msg {
                 // Parse the router's response containing the selected worker ID
-                let response_data: serde_json::Value = serde_json::from_slice(&msg.payload)
-                    .map_err(to_pyerr)?;
+                let response_data: serde_json::Value =
+                    serde_json::from_slice(&msg.payload).map_err(to_pyerr)?;
 
-                let prefill_worker_id = response_data["prefill_worker_id"]
-                    .as_i64()
-                    .ok_or_else(|| to_pyerr(anyhow::anyhow!("Invalid prefill_worker_id in response")))?;
+                let prefill_worker_id =
+                    response_data["prefill_worker_id"].as_i64().ok_or_else(|| {
+                        to_pyerr(anyhow::anyhow!("Invalid prefill_worker_id in response"))
+                    })?;
 
                 Ok(prefill_worker_id)
             } else {
-                Err(to_pyerr(anyhow::anyhow!("No response from frontend router")))
+                Err(to_pyerr(anyhow::anyhow!(
+                    "No response from frontend router"
+                )))
             }
         })
     }
