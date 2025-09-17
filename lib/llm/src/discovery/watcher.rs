@@ -319,7 +319,7 @@ impl ModelWatcher {
             // handle Chat or Completions requests, so handle whatever the model supports.
 
             // Build a KV chooser only in KV routing mode. The chooser encapsulates
-            // intelligent selection (overlap/load) for internal routing decisions.
+            // intelligent selection (overlap & load) for internal routing decisions.
             let kv_chooser = if self.router_mode == RouterMode::KV {
                 Some(
                     self.manager
