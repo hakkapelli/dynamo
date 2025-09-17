@@ -162,7 +162,7 @@ pub async fn start_kv_router_background(
         ))?;
 
         match nats_client
-            .object_store_download_data::<Vec<RouterEvent>>(url)
+            .object_store_download_data::<Vec<RouterEvent>>(&url)
             .await
         {
             Ok(events) => {
@@ -331,7 +331,7 @@ pub async fn start_kv_router_background(
                     };
 
                     // Perform snapshot upload and purge
-                    match perform_snapshot_and_purge(
+                    match purge_then_snapshot(
                         &mut nats_queue,
                         snapshot_tx,
                         resources
@@ -413,15 +413,19 @@ pub async fn start_kv_router_background(
 }
 
 /// Perform snapshot upload and purge operations
-async fn perform_snapshot_and_purge(
+async fn purge_then_snapshot(
     nats_queue: &mut NatsQueue,
     snapshot_tx: &mpsc::Sender<DumpRequest>,
     resources: &SnapshotResources,
 ) -> anyhow::Result<()> {
-    // Snapshot before purge ensures we capture the current state before removing any messages.
-    // This guarantees the snapshot matches what has been acknowledged up to this point.
+    // Purge before snapshot ensures new/warm-restarted routers won't replay already-acknowledged messages.
+    // Since KV events are idempotent, this ordering reduces unnecessary reprocessing while maintaining
+    // at-least-once delivery guarantees. The snapshot will capture the clean state after purge.
 
-    // First, request a snapshot from the indexer
+    // First, purge acknowledged messages from the stream
+    nats_queue.purge_acknowledged().await?;
+
+    // Now request a snapshot from the indexer (which reflects the post-purge state)
     let (resp_tx, resp_rx) = oneshot::channel();
     let dump_req = DumpRequest { resp: resp_tx };
 
@@ -444,7 +448,7 @@ async fn perform_snapshot_and_purge(
 
     resources
         .nats_client
-        .object_store_upload_data(&events, url)
+        .object_store_upload_data(&events, &url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to upload snapshot: {e:?}"))?;
 
@@ -453,9 +457,6 @@ async fn perform_snapshot_and_purge(
         events.len(),
         resources.bucket_name
     );
-
-    // Now purge acknowledged messages from the stream
-    nats_queue.purge_acknowledged().await?;
 
     Ok(())
 }

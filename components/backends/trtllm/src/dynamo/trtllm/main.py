@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import logging
 import os
 import signal
 import sys
 
 import uvloop
-from tensorrt_llm import SamplingParams
 from tensorrt_llm.llmapi import (
     BuildConfig,
     CapacitySchedulerPolicy,
@@ -16,6 +16,7 @@ from tensorrt_llm.llmapi import (
     KvCacheConfig,
     SchedulerConfig,
 )
+from tensorrt_llm.llmapi.llm import SamplingParams
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.llmapi.tokenizer import tokenizer_factory
 from torch.cuda import device_count
@@ -35,6 +36,7 @@ from dynamo.trtllm.request_handlers.handlers import (
 from dynamo.trtllm.utils.trtllm_utils import (
     Config,
     cmd_line_args,
+    deep_update,
     is_first_worker,
     parse_endpoint,
 )
@@ -192,6 +194,17 @@ async def init(runtime: DistributedRuntime, config: Config):
     if config.extra_engine_args != "":
         # TODO: Support extra engine args from json file as well.
         arg_map = update_llm_args_with_extra_options(arg_map, config.extra_engine_args)
+
+    # Apply override_engine_args if provided
+    if config.override_engine_args != "":
+        try:
+            overrides = json.loads(config.override_engine_args)
+            logging.info(f"Applying engine arg overrides: {overrides}")
+
+            deep_update(arg_map, overrides)
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse override_engine_args as JSON: {e}")
+            sys.exit(1)
     if config.publish_events_and_metrics:
         # 'event_buffer_max_size' is required to enable TRTLLM to publish kv cache events.
         kv_cache_config = None
